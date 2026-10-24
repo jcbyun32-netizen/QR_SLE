@@ -6,6 +6,7 @@
   <title>QR & 시리얼 자동 비교</title>
   <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.19.1/umd/index.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -66,6 +67,12 @@
     }
     button:disabled { background: #ccc; }
 
+    .export-box { margin-top: 12px; padding: 10px; border: 1px solid #ddd; border-radius: 10px; text-align: left; }
+    .export-box .row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #555; }
+    .export-box select { flex: 1; padding: 8px; font-size: 14px; border-radius: 6px; border: 1px solid #ccc; }
+    #exportBtn { background: #1d7a46; }
+    #clearBtn { background: #6c757d; font-size: 14px; padding: 10px; }
+    .history { max-height: 240px; overflow-y: auto; }
     .history { margin-top: 12px; text-align: left; font-size: 13px; }
     .history div { padding: 6px 8px; border-bottom: 1px solid #eee; word-break: break-all; }
     .history .ok { color: #155724; }
@@ -125,6 +132,12 @@
   <button id="scanBtn" onclick="togglePause()" disabled>일시정지</button>
   <div class="stats" id="stats">일치 0 · 불일치 0</div>
 
+  <div class="export-box">
+    <div class="row"><label for="dateSel">저장할 날짜</label><select id="dateSel"></select></div>
+    <button id="exportBtn" type="button">📥 엑셀로 저장</button>
+    <button id="clearBtn" type="button">오늘 기록 지우기</button>
+  </div>
+
   <div class="history" id="history"></div>
 
   <!-- 검증 완료 후 표시되는 결과 팝업 (확인 버튼을 눌러야 다음 스캔 시작) -->
@@ -157,8 +170,76 @@
     let busy = false;        // 검증 중이거나 팝업이 떠 있는 동안 true → 새 스캔 무시
     let torchOn = false;
     let focusTimer = null;
-    const stats = { ok: 0, ng: 0 };
-    const history = [];
+    // ---- 하루 검증 기록 (브라우저에 날짜별로 자동 저장됨) ----
+    const STORE_PREFIX = 'qrHistory:';
+    let records = [];
+    let recordsKey = '';
+
+    function todayKey() {
+      const d = new Date(), p = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    }
+    function readDay(key) {
+      try { return JSON.parse(localStorage.getItem(STORE_PREFIX + key) || '[]').filter(r => r.status === 'match'); } catch (e) { return []; }
+    }
+    function loadRecords() {
+      recordsKey = todayKey();
+      records = readDay(recordsKey);
+      // 60일이 지난 기록은 정리
+      try {
+        const limit = Date.now() - 60 * 86400000;
+        Object.keys(localStorage).filter(k => k.startsWith(STORE_PREFIX)).forEach(k => {
+          if (new Date(k.slice(STORE_PREFIX.length)).getTime() < limit) localStorage.removeItem(k);
+        });
+      } catch (e) {}
+    }
+    function saveRecords() {
+      try { localStorage.setItem(STORE_PREFIX + recordsKey, JSON.stringify(records)); }
+      catch (e) { console.warn('기록 저장 실패', e); }
+    }
+    function addRecord(r) {
+      if (recordsKey !== todayKey()) loadRecords();   // 자정이 지났으면 새 날짜로
+      records.push(r);
+      saveRecords();
+      renderHistory();
+    }
+    function statusLabel(r) {
+      if (r.status === 'match') return r.fuzzy ? '일치(유사문자 보정)' : '일치';
+      return r.status === 'mismatch' ? '불일치' : '미인식';
+    }
+    function refreshDateSelect() {
+      const sel = $('dateSel');
+      const prev = sel.value;
+      let keys = [];
+      try { keys = Object.keys(localStorage).filter(k => k.startsWith(STORE_PREFIX)).map(k => k.slice(STORE_PREFIX.length)); } catch (e) {}
+      if (!keys.includes(recordsKey)) keys.push(recordsKey);
+      keys.sort().reverse();
+      sel.innerHTML = keys.map(k => {
+        const n = k === recordsKey ? records.length : readDay(k).length;
+        return `<option value="${k}">${k}${k === recordsKey ? ' (오늘)' : ''} · ${n}건</option>`;
+      }).join('');
+      sel.value = keys.includes(prev) ? prev : recordsKey;
+    }
+
+    function exportExcel() {
+      const key = $('dateSel').value || recordsKey;
+      const rows = key === recordsKey ? records : readDay(key);
+      if (!rows.length) { alert('저장할 기록이 없습니다.'); return; }
+      if (typeof XLSX === 'undefined') { alert('엑셀 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.'); return; }
+
+      const head = ['번호', '날짜', '시간', 'QR 값', '인식된 글자', '결과'];
+      const body = rows.map((r, i) => [i + 1, key, r.time, r.qr, (r.ocr || '').replace(/\s*\n+\s*/g, ' '), statusLabel(r)]);
+      const ws = XLSX.utils.aoa_to_sheet([head, ...body]);
+      ws['!cols'] = [{ wch: 6 }, { wch: 12 }, { wch: 10 }, { wch: 34 }, { wch: 40 }, { wch: 18 }];
+
+      const ws2 = XLSX.utils.aoa_to_sheet([['날짜', key], ['일치 확인 건수', rows.length]]);
+      ws2['!cols'] = [{ wch: 14 }, { wch: 14 }];
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'QR검증');
+      XLSX.utils.book_append_sheet(wb, ws2, '요약');
+      XLSX.writeFile(wb, `QR검증_${key}.xlsx`);
+    }
 
     const READY_TEXT = "QR코드를 찾는 중... 점선 안에 라벨을 맞춰주세요.";
 
@@ -430,10 +511,8 @@
       let icon, title, btn;
       if (o.status === 'match') {
         icon = '✅'; title = 'QR과 시리얼이 일치합니다'; btn = '확인 (다음 라벨 스캔)';
-        stats.ok++;
       } else if (o.status === 'mismatch') {
         icon = '❌'; title = 'QR과 시리얼이 일치하지 않습니다'; btn = '다시 스캔';
-        stats.ng++;
       } else {
         icon = '⚠️'; title = '시리얼을 확인하지 못했습니다'; btn = '다시 스캔';
       }
@@ -450,9 +529,12 @@
 
       if (navigator.vibrate) navigator.vibrate(o.status === 'match' ? 120 : [200, 100, 200]);
 
-      history.unshift({ status: o.status, qr: qrText, time: new Date().toLocaleTimeString('ko-KR', { hour12: false }) });
-      if (history.length > 8) history.pop();
-      renderHistory();
+      if (o.status === 'match') {   // 불일치/미인식은 저장하지 않음
+        addRecord({
+          status: 'match', fuzzy: !!o.note, qr: qrText, ocr: o.text || '',
+          time: new Date().toLocaleTimeString('ko-KR', { hour12: false })
+        });
+      }
       statusEl.innerText = "검증 완료! 결과를 확인하고 버튼을 눌러주세요.";
     }
 
@@ -463,16 +545,26 @@
     });
 
     function renderHistory() {
-      $('stats').innerText = `일치 ${stats.ok} · 불일치 ${stats.ng}`;
-      $('history').innerHTML = history.map(h => {
-        const ok = h.status === 'match';
-        const cls = ok ? 'ok' : 'ng';
-        const label = ok ? '✅ 일치' : (h.status === 'mismatch' ? '❌ 불일치' : '⚠️ 미인식');
-        return `<div class="${cls}">${h.time} · ${label} · ${esc(h.qr)}</div>`;
-      }).join('');
+      $('stats').innerText = `오늘 일치 확인 ${records.length}건 (일치한 건만 저장됩니다)`;
+      $('history').innerHTML = records.slice().reverse().map(r =>
+        `<div class="ok">${esc(r.time)} · ✅ ${statusLabel(r)} · ${esc(r.qr)}</div>`
+      ).join('');
+      refreshDateSelect();
     }
 
+    $('exportBtn').addEventListener('click', exportExcel);
+    $('clearBtn').addEventListener('click', () => {
+      if (!records.length) return;
+      if (confirm(`오늘 기록 ${records.length}건을 모두 지울까요?\n(엑셀로 저장하지 않았다면 복구할 수 없습니다)`)) {
+        records = [];
+        saveRecords();
+        renderHistory();
+      }
+    });
+
     window.addEventListener('DOMContentLoaded', () => {
+      loadRecords();
+      renderHistory();
       initOCR();
       startQrScanning();
     });
